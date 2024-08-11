@@ -20,8 +20,8 @@ This repository contains the implementation of a multi-task deep learning framew
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/your-username/multi-task-deep-learning.git
-cd multi-task-deep-learning
+git clone https://github.com/guangboyu/multi_task_HCC_classification.git
+cd multi_task_HCC_classification
 ```
 
 2. Create and activate a virtual environment:
