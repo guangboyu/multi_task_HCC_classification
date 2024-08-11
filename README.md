@@ -1,4 +1,3 @@
-Certainly! Here is a draft for the `README.md` file for your project:
 
 ---
 
@@ -77,12 +76,4 @@ This project is licensed under the MIT License.
 
 ## Acknowledgements
 
-Special thanks to the research team and contributors who provided invaluable input and resources for this project.
-
----
-
-For detailed information on each module, please refer to the corresponding Python files in the repository.
-
----
-
-Feel free to modify the above template to better fit your project's specifics and add any additional sections you deem necessary.
+Special thanks to the UCI Translational Lab team and contributors who provided invaluable input and resources for this project.
