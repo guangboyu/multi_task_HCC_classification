@@ -8,8 +8,24 @@ class Config:
     all_dir = "Data/BF_SD_all_slices_0610"
     num_classes = 4
     num_epochs = 30
+    batch_size = 16
+
+    Segmentation_Architecture = [
+                                 # "UNet++",
+                                 # "MAnet",
+                                 "DeepLabV3Plus",
+                                 # "FPN",
+                                 # "PSPNet",
+                                 # "Linknet",
+                                 # "PAN"
+                                ]
+    ENCODER = 'efficientnet-b0'
+    ENCODER_WEIGHTS = 'imagenet'
+
+    all_train = "Data/All_Slice_Train"
+    all_test = "Data/All_Slice_Test"
 
     # segmentation loss weight
-    alpha = 0.9
+    alpha = 0.5
     # segmentation loss mode
     segmentation_loss = "binary"

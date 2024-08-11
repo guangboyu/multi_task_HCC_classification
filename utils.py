@@ -1,6 +1,7 @@
 import numpy as np
-from sklearn.metrics import roc_auc_score, confusion_matrix, roc_curve, auc, mutual_info_score
+from sklearn.metrics import roc_auc_score, confusion_matrix, roc_curve, auc, mutual_info_score, accuracy_score
 from sklearn.utils import resample
+from sklearn.preprocessing import label_binarize
 import re
 import matplotlib.pyplot as plt
 import os
@@ -17,8 +18,6 @@ from torch.utils.data import DataLoader
 
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, accuracy_score
-from sklearn.preprocessing import label_binarize
 
 from config import Config
 
@@ -33,45 +32,17 @@ def load_checkpoint(checkpoint, model):
     model.load_state_dict(checkpoint["state_dict"])
 
 
-def get_loaders(
-    train_dir,
-    train_maskdir,
-    val_dir,
-    val_maskdir,
-    batch_size,
-    train_transform,
-    val_transform,
-    num_workers=4,
-    pin_memory=True,
-):
-    train_ds = CarvanaDataset(
-        image_dir=train_dir,
-        mask_dir=train_maskdir,
-        transform=train_transform,
-    )
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        shuffle=True,
-    )
 
-    val_ds = CarvanaDataset(
-        image_dir=val_dir,
-        mask_dir=val_maskdir,
-        transform=val_transform,
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        shuffle=False,
-    )
-
+def get_data_loaders(dataset, train_ids, val_ids, augment=False):
+    train_subs = Subset(dataset, train_ids)
+    val_subs = Subset(dataset, val_ids)
+    train_loader = DataLoader(train_subs, batch_size=Config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_subs, batch_size=Config.batch_size, shuffle=False)
     return train_loader, val_loader
 
 
@@ -204,8 +175,52 @@ def calculate_mutual_info(pred, target):
     return mutual_info_score(pred_flat, target_flat)
 
 
+def compute_confidence_intervals(true_labels, predictions, num_classes, num_bootstraps=1000, random_seed=42):
+    rng = np.random.RandomState(random_seed)
+    bootstrapped_scores = {'auroc_ci': [], 'sensitivity_ci': [], 'specificity_ci': [], 'accuracy_ci': []}
+
+    for i in range(num_bootstraps):
+        # Bootstrap by sampling with replacement
+        indices = rng.randint(0, len(predictions), len(predictions))
+        if len(np.unique(true_labels[indices])) < 2:
+            # We need at least one example of each class to compute ROC AUC
+            continue
+
+        y_true = true_labels[indices]
+        y_pred = predictions[indices]
+
+        # Ensure y_true is in multiclass format
+        y_true_multiclass = np.argmax(y_true, axis=1) if y_true.ndim > 1 else y_true
+
+        # Compute AUROC
+        try:
+            auroc = roc_auc_score(y_true, y_pred, multi_class='ovr')
+            bootstrapped_scores['auroc_ci'].append(auroc)
+        except ValueError:
+            continue
+
+        # Compute accuracy
+        accuracy = accuracy_score(y_true_multiclass, np.argmax(y_pred, axis=1))
+        bootstrapped_scores['accuracy_ci'].append(accuracy)
+
+        # Compute sensitivity and specificity
+        cm = confusion_matrix(y_true_multiclass, np.argmax(y_pred, axis=1), labels=np.arange(num_classes))
+        sensitivity = np.diag(cm) / np.maximum(1, cm.sum(axis=1))
+        specificity = np.diag(cm) / np.maximum(1, cm.sum(axis=0))
+        bootstrapped_scores['sensitivity_ci'].append(np.mean(sensitivity))
+        bootstrapped_scores['specificity_ci'].append(np.mean(specificity))
+
+    # Compute 95% CI
+    confidence_intervals = {}
+    for metric in bootstrapped_scores:
+        scores = np.array(bootstrapped_scores[metric])
+        confidence_intervals[metric] = (np.percentile(scores, 2.5), np.percentile(scores, 97.5))
+
+    return confidence_intervals
+
+
 def check_metrics(
-    loader, model, device, return_images_for_visualization=False, save_path=None, metrics_list=None
+        loader, model, device, return_images_for_visualization=False, save_path=None, metrics_list=None
 ):
     model.eval()
 
@@ -227,7 +242,7 @@ def check_metrics(
             # save segmentation image result
             if return_images_for_visualization:
                 file_path = os.path.join(
-                    save_path, f"Segmentation_Result_{batch_index+1}.png"
+                    save_path, f"Segmentation_Result_{batch_index + 1}.png"
                 )
                 # save_segmentation_visualization(
                 #     data.cpu()[0], preds_masks.cpu()[0], targets.cpu()[0], file_path
@@ -244,8 +259,7 @@ def check_metrics(
                 # Calculate metrics for each sample
                 iou_temp = iou_score(preds_masks[i], targets[i]).cpu().item()
                 dice_temp = dice_score(preds_masks[i], targets[i]).cpu().item()
-                mutual_info = calculate_mutual_info(preds_masks[i].cpu().numpy(), targets[i].cpu().numpy())
-
+                # mutual_info = calculate_mutual_info(preds_masks[i].cpu().numpy(), targets[i].cpu().numpy())
 
                 # Save metrics per sample
                 if 'image_path' in metrics_list and iou_temp < metrics_list['iou']:
@@ -253,7 +267,7 @@ def check_metrics(
                 # Extract type from path
                 type_name = os.path.basename(os.path.dirname(os.path.dirname(img_paths[i])))
                 metrics_list.append({'image_path': img_paths[i], 'iou': iou_temp, 'dice': dice_temp,
-                                     'mutual_info': mutual_info, 'type': type_name})
+                                     'type': type_name})
 
             # accuracy
             # Convert logits to class indices for accuracy
@@ -288,9 +302,7 @@ def check_metrics(
         all_labels_bin = label_binarize(all_labels, classes=range(Config.num_classes))
 
         if Config.num_classes == 2:  # binary case, need to adjust shape
-            all_labels_bin = all_labels_bin[
-                :, 1
-            ]  # take the second column for positive class
+            all_labels_bin = all_labels_bin[:, 1]  # take the second column for positive class
         avg_auroc = roc_auc_score(all_labels_bin, all_preds, multi_class="ovr")
 
         sensitivity = np.diag(total_confusion) / np.maximum(
@@ -318,12 +330,16 @@ def check_metrics(
             "avg_sensitivity": np.mean(sensitivity),
             "avg_specificity": np.mean(specificity),
             "all_preds": all_preds,
+            "total_confusion": total_confusion
         }
+
+        confidence_intervals = compute_confidence_intervals(all_labels_bin, all_preds, Config.num_classes)
+        metrics.update(confidence_intervals)
     model.train()
     return metrics
 
 
-def plot_multiclass_roc(true_labels_bin, all_preds, num_classes, save_path=None):
+def plot_multiclass_roc(true_labels_bin, all_preds, num_classes, save_path=None, label_names=None):
     # Calculate ROC curve and ROC area for each class
     fpr = dict()
     tpr = dict()
@@ -360,20 +376,23 @@ def plot_multiclass_roc(true_labels_bin, all_preds, num_classes, save_path=None)
     plt.plot(
         mean_fpr,
         mean_tpr,
-        label="Mean ROC : {0:0.2f}".format(mean_auc),
+        label="Mean: {0:0.2f}".format(mean_auc),
         linewidth=2,
     )
 
     for i in range(num_classes):
-        plt.plot(fpr[i], tpr[i], lw=2, label='class {0} AUC : {1:0.2f}'.format(i, roc_auc[i]), linestyle="dotted")
+        # plt.plot(fpr[i], tpr[i], lw=2, label='class {0} AUC : {1:0.2f}'.format(i, roc_auc[i]), linestyle="dotted")
+        label = label_names[i] if label_names else f'class {i}'
+        plt.plot(fpr[i], tpr[i], lw=2, label=f'{label}: {roc_auc[i]:0.2f}', linestyle="dotted")
 
     plt.plot([0, 1], [0, 1], "k--", lw=2)
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
+    # plt.figure(figsize=(10, 8))
     plt.xlabel("1 - Specificity (FPR)")
     plt.ylabel("Sensitivity (TPR)")
     plt.title("Deep Learning Multi-class ROC")
-    plt.legend(loc="lower right")
+    plt.legend(loc="lower right", fontsize="small")
     plt.savefig("Figures/" + save_path, dpi=600, bbox_inches="tight")
     plt.show()
 
@@ -427,11 +446,13 @@ def save_predicted_masks(loader, model, device, fold):
 
             for i, path in enumerate(img_paths):
                 save_path = path.replace("Separate", f"Separate_pred_fold{fold}")
-                pred_mask_resized = cv2.resize(pred_mask[i, 0], (int(original_size[i]), int(original_size[i])))  # Resize to original size
+                pred_mask_resized = cv2.resize(pred_mask[i, 0], (
+                int(original_size[i]), int(original_size[i])))  # Resize to original size
                 pred_mask_img = (pred_mask_resized > 0.5).astype(np.uint8)
                 pred_mask_nib = nib.Nifti1Image(pred_mask_img, affine=None)
                 nib.save(pred_mask_nib, save_path)
     model.train()
+
 
 def remove_pred_mask():
     # Define the pattern for the files to be deleted
@@ -445,8 +466,6 @@ def remove_pred_mask():
     for file_path in files_to_delete:
         try:
             os.remove(file_path)
-            print(f"Deleted: {file_path}")
+            # print(f"Deleted: {file_path}")
         except Exception as e:
             print(f"Error deleting file {file_path}: {e}")
-
-

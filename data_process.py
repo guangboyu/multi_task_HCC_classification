@@ -22,15 +22,16 @@ from config import Config
 # from dl_config import Config
 
 
-
-
-
 class MRIDataset_Unet_Classification(Dataset):
-    def __init__(self, root_dir, transform=None, return_original=False):
+    """
+    Dataset for single MRI image
+    """
+    def __init__(self, root_dir, transform=None, return_original=False, preprocessing=None):
         self.root_dir = root_dir
         self.transform = transform
         self.return_original = return_original
-        self.images, self.labels, self.sample_ids = self.load_images_and_labels()
+        self.preprocessing = preprocessing
+        self.images, self.labels, self.sample_ids, self.label_to_int = self.load_images_and_labels()
 
     def load_images_and_labels(self):
         images = []
@@ -53,6 +54,9 @@ class MRIDataset_Unet_Classification(Dataset):
 
                         mask_path = img_path.replace("Separate", "MASK")
                         mask_number = extract_mask_number(mask_path)
+                        if mask_number is None:
+                            print(f"Warning: Could not extract mask number from path: {mask_path}")
+                            continue
                         mask_path = os.path.join(
                             class_path, patient_id, "MASK_" + mask_number + ".nii.gz"
                         )
@@ -62,12 +66,13 @@ class MRIDataset_Unet_Classification(Dataset):
                             mask = nib.load(mask_path).get_fdata().astype(np.float32)
                             if image.shape != mask.shape:
                                 continue
+
                             images.append((img_path, mask_path))
                             labels.append(label_int)
                             sample_ids.append(patient_id)
                 # Config.num_classes = len(label_dir)
-
-        return images, labels, sample_ids
+        print("label to int", label_to_int)
+        return images, labels, sample_ids, label_to_int
 
     def __len__(self):
         return len(self.images)
@@ -98,12 +103,19 @@ class MRIDataset_Unet_Classification(Dataset):
         # Ensure masks are binary
         mask[mask > 0.0] = 1.0
 
+        # Dilate the mask to increase the ROI size
+        # structure = np.ones((3, 3))  # Define the structuring element for dilation
+        # mask = binary_dilation(mask, structure=structure).astype(np.float32)
+
         label = self.labels[idx]
 
         if self.transform:
             augmentations = self.transform(image=image, mask=mask)
             image = augmentations["image"]
             mask = augmentations["mask"]
+        if self.preprocessing:
+            sample = self.preprocessing(image=image, mask=mask)
+            image, mask = sample['image'], sample['mask']
         if self.return_original:
             return image, mask, label, original_size[0], img_path
         else:
@@ -114,6 +126,112 @@ class MRIDataset_Unet_Classification(Dataset):
             return "Treatment"
         else:
             return "Control"
+
+
+class MultiSequenceMRIDataset(Dataset):
+    """
+    Dataset for multi-sequence MRI images (put in different channels)
+    """
+    def __init__(self, root_dir, transform=None, return_original=False, preprocessing=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.return_original = return_original
+        self.preprocessing = preprocessing
+        self.images, self.labels, self.sample_ids, self.label_to_int = self._load_images_and_labels()
+
+    def _load_images_and_labels(self):
+        images = []
+        labels = []
+        sample_ids = []
+        label_to_int = {}
+
+        for label_dir in self._get_label_dirs():
+            class_path = os.path.join(self.root_dir, label_dir)
+            label_int = label_to_int.setdefault(label_dir, len(label_to_int))
+
+            for patient_id in os.listdir(class_path):
+                patient_path = os.path.join(class_path, patient_id)
+
+                t1w_paths = glob.glob(os.path.join(patient_path, "T1W_HR_Separate_*.nii.gz"))
+                t2w_paths = glob.glob(os.path.join(patient_path, "T2W_HR_Separate_*.nii.gz"))
+                t1w_pc_paths = glob.glob(os.path.join(patient_path, "T1W_PC_Separate_*.nii.gz"))
+
+                if not t1w_paths or not t2w_paths or not t1w_pc_paths:
+                    print("No data path for {}".format(patient_path))
+                    continue
+
+                for t1w_path, t2w_path, t1w_pc_path in zip(t1w_paths, t2w_paths, t1w_pc_paths):
+                    mask_path = self._get_mask_path(t1w_path)
+                    if not os.path.isfile(mask_path):
+                        continue
+
+                    if self._validate_image_mask_shapes([t1w_path, t2w_path, t1w_pc_path, mask_path]):
+                        images.append((t1w_path, t2w_path, t1w_pc_path, mask_path))
+                        labels.append(label_int)
+                        sample_ids.append(patient_id)
+
+        print("label to int", label_to_int)
+        return images, labels, sample_ids, label_to_int
+
+    def _get_label_dirs(self):
+        return [d for d in os.listdir(os.path.join(os.getcwd(), self.root_dir)) if d in ["Combination", "Sorafenib", "NK", "Control"]]
+
+    def _get_mask_path(self, t1w_path):
+        mask_path = t1w_path.replace("Separate", "MASK")
+        mask_number = extract_mask_number(mask_path)
+        if mask_number is None:
+            print(f"Warning: Could not extract mask number from path: {mask_path}")
+            return
+        parent_dir = os.path.dirname(t1w_path)
+        mask_path = os.path.join(parent_dir, "MASK_" + mask_number + ".nii.gz")
+        return mask_path
+
+
+    def _validate_image_mask_shapes(self, paths):
+        images = [nib.load(p).get_fdata().astype(np.float32) for p in paths[:3]]
+        mask = nib.load(paths[3]).get_fdata().astype(np.float32)
+        return all(image.shape == mask.shape for image in images)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        t1w_path, t2w_path, t1w_pc_path, mask_path = self.images[idx]
+        t1w_image, t2w_image, t1w_pc_image, mask = self._load_images(t1w_path, t2w_path, t1w_pc_path, mask_path)
+
+        image = self._merge_images(t1w_image, t2w_image, t1w_pc_image)
+        original_size = image.shape if self.return_original else None
+
+        mask = self._process_mask(mask)
+        label = self.labels[idx]
+
+        if self.transform:
+            image, mask = self._apply_transform(image, mask)
+        if self.preprocessing:
+            image, mask = self._apply_preprocessing(image, mask)
+
+        if self.return_original:
+            return image, mask, label, original_size[0], t1w_path
+        else:
+            return image, mask, label
+
+    def _load_images(self, *paths):
+        return [nib.load(p).get_fdata().astype(np.float32) for p in paths]
+
+    def _merge_images(self, t1w_image, t2w_image, t1w_pc_image):
+        return np.stack((t1w_image, t2w_image, t1w_pc_image), axis=2)
+
+    def _process_mask(self, mask):
+        mask[mask > 0.0] = 1.0
+        return mask
+
+    def _apply_transform(self, image, mask):
+        augmentations = self.transform(image=image, mask=mask)
+        return augmentations["image"], augmentations["mask"]
+
+    def _apply_preprocessing(self, image, mask):
+        sample = self.preprocessing(image=image, mask=mask)
+        return sample['image'], sample['mask']
 
 
 class ZNormalization(torch.nn.Module):
@@ -153,93 +271,56 @@ class ZNormalization(torch.nn.Module):
 #     ]
 # )
 
+# train_transform = A.Compose(
+#     [
+#         A.Resize(224, 224),
+#         A.Normalize(
+#             mean=[0.0, 0.0, 0.0],
+#             std=[1.0, 1.0, 1.0],
+#             max_pixel_value=255.0,
+#         ),
+#         ToTensorV2(),
+#     ],
+#     # is_check_shapes=False
+# )
+
 train_transform = A.Compose(
     [
         A.Resize(224, 224),
+        # A.HorizontalFlip(p=0.5),  # Randomly flip images horizontally
+        # A.VerticalFlip(p=0.5),    # Randomly flip images vertically
+        # A.RandomRotate90(p=0.5),  # Randomly rotate images by 90 degrees
+        # A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+        # A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.5),
+        # A.GridDistortion(p=0.5),
+        # A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+        # A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+        A.RandomBrightnessContrast(p=1.0, contrast_limit=0.3),
+        # A.HueSaturationValue(p=0.5),
         A.Normalize(
             mean=[0.0, 0.0, 0.0],
             std=[1.0, 1.0, 1.0],
             max_pixel_value=255.0,
         ),
-        # A.Normalize(
-        #     mean=[0.485, 0.456, 0.406],
-        #     std=[0.229, 0.224, 0.225],
-        #     max_pixel_value=255.0,
-        # ),
-        # A.HorizontalFlip(p=0.5),
-        # A.VerticalFlip(p=0.5),
-        # A.Rotate(limit=15, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-        # A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        # A.GaussNoise(var_limit=(10, 50), p=0.5),
-        # ZNormalization(),
-        ToTensorV2(),
-    ],
-    # is_check_shapes=False
+        ToTensorV2()
+    ]
 )
 
-val_transforms = A.Compose(
+valid_transform = A.Compose(
     [
         A.Resize(height=224, width=224),
         A.Normalize(
             mean=[0.0, 0.0, 0.0],
             std=[1.0, 1.0, 1.0],
-            max_pixel_value=255.0,
+            # max_pixel_value=255.0,
         ),
+        # ZNormalization(),
         ToTensorV2(),
     ],
 )
 
-# transform = v2.Compose([
-#     v2.ToPILImage(),
-#     v2.RandomResizedCrop(size=(224, 224), antialias=True),
-#     v2.RandomHorizontalFlip(p=0.5),
-#     v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-# ])
-
-# transform = transforms.Compose([
-#     transforms.ToPILImage(),  # Convert to PIL Image first for most transformations
-#     transforms.Resize((256, 256)),  # Resize the image to slightly larger than the final size
-#     transforms.RandomCrop((224, 224)),  # Randomly crop to the final size
-#     transforms.RandomHorizontalFlip(),  # Randomly flip the images horizontally
-#     transforms.RandomVerticalFlip(),  # Randomly flip the images vertically
-#     transforms.RandomRotation(degrees=15),  # Randomly rotate the images in the range (-15, 15)
-#     transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),  # Randomly jitter the brightness, contrast, saturation and hue
-#     transforms.ToTensor(),  # Convert the PIL Image to a tensor
-#     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # Normalize with mean and std for pretrained models
-# ])
-
-# dataset = MRIDataset_Unet_Classification(Config.buffalo_dir, transform=train_transform, return_original=True)
-# print("length of dataset", len(dataset))
-# loader = DataLoader(dataset, batch_size=1, shuffle=True)
-# for l in loader:
-#     image, mask, label, original, original_size = l
-#     print("after image size: ", image.size())
-#     print("after mask size: ", mask.size())
-#     print("label: ", label)
-#     print("original: ", original.shape)
-#     print("orignal size: ", original_size)
-#     print("----------")
-#     # break
-
-# dataset = MRIDataset_Unet_Classification(Config.all_dir, transform=train_transform, return_original=True)
-# print("length of dataset", len(dataset))
-# loader = DataLoader(dataset, batch_size=8, shuffle=True)
-# for i, (image, mask, label, original_size) in enumerate(tqdm(loader)):
-#     # print("after image size: ", image.size())
-#     # print("after mask size: ", mask.size())
-#     # print("label: ", label)
-#     # # print("original: ", original.shape)
-#     # print("orignal size: ", original_size)
-#     # print("----------")
-#     # break
-
-#
-#
-# dataset = MRIDataset_Unet(Config.buffalo_dir, transform=train_transform)
-# print("length of dataset", len(dataset))
-# loader = DataLoader(dataset, batch_size=1, shuffle=True)
-# for l in loader:
-#     image, mask = l
-#     print("after image size: ", image.size())
-#     print("after mask size: ", mask.size())
+# Train_data = MultiSequenceMRIDataset(Config.all_dir, transform=valid_transform, return_original=True)
+# Train_loader = DataLoader(Train_data, batch_size=16, shuffle=True)
+# for loader in Train_loader:
+#     print(loader[0].shape)
 #     break

@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as TF
+import segmentation_models_pytorch as smp
+
+from config import Config
 
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -65,6 +68,76 @@ class UNET(nn.Module):
             x = self.ups[idx+1](concat_skip)
 
         return self.final_conv(x)
+
+
+aux_params = dict(
+    pooling="avg",  # one of 'avg', 'max'
+    dropout=0.5,  # dropout ratio, default is None
+    activation="sigmoid",  # activation function, default is None
+    classes=Config.num_classes,  # define number of output labels
+)
+
+
+def get_model(device, model_name="UNet++"):
+    if model_name == "UNet++":
+        model = smp.UnetPlusPlus(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    elif model_name == "MAnet":
+        model = smp.MAnet(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    elif model_name == "FPN":
+        model = smp.FPN(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    elif model_name == "DeepLabV3Plus":
+        model = smp.DeepLabV3Plus(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    elif model_name == "PSPNet":
+        model = smp.PSPNet(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    elif model_name == "Linknet":
+        model = smp.Linknet(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    elif model_name == "PAN":
+        model = smp.PAN(
+            encoder_name=Config.ENCODER,
+            encoder_weights=Config.ENCODER_WEIGHTS,
+            in_channels=3,
+            aux_params=aux_params,
+            classes=1,
+        ).to(device)
+    else:
+        print("No model name found!\n")
+    return model
 
 def test():
     x = torch.randn((3, 1, 161, 161))
